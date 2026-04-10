@@ -1,0 +1,342 @@
+---
+title: "Global COVID-19 Trends Using the Johns Hopkins CSSE Dataset"
+author: "Li Hsiang Chao"
+date: "2026-04-10"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+```
+
+## Question of Interest
+
+This report analyzes the global COVID-19 time-series data from the Johns Hopkins CSSE GitHub repository.
+
+The main question of interest is:
+
+**Among the countries with the highest cumulative confirmed COVID-19 case counts, how did case patterns evolve over time, and how strongly were later deaths associated with recent case levels?**
+
+To answer this question, this report will:
+
+1. Import the Johns Hopkins global confirmed and deaths datasets directly from GitHub.
+2. Tidy the data into a long format suitable for analysis.
+3. Compare the countries with the highest cumulative confirmed cases.
+4. Examine how new case waves changed over time for the most affected countries.
+5. Fit a simple lag-based model linking recent cases to later deaths.
+6. Evaluate the model using both a relationship plot and an observed-versus-fitted plot.
+
+## Data Source and Description
+
+The data comes from the **Johns Hopkins University Center for Systems Science and Engineering (CSSE) COVID-19 GitHub repository**.
+
+This report uses two global time-series files:
+
+- `time_series_covid19_confirmed_global.csv`
+- `time_series_covid19_deaths_global.csv`
+
+These files record cumulative daily COVID-19 counts by country and, where relevant, province or state. For this analysis, province/state rows are aggregated to the country level so that each country has one daily confirmed count series and one daily deaths count series.
+
+## Load Data from the Web
+
+The data is loaded directly from the Johns Hopkins GitHub raw CSV links so that the project is reproducible and can be knitted by anyone without downloading files manually.
+
+```{r load-data, include=FALSE}
+base_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+confirmed_url <- paste0(base_url, "time_series_covid19_confirmed_global.csv")
+deaths_url    <- paste0(base_url, "time_series_covid19_deaths_global.csv")
+
+confirmed_raw <- read_csv(confirmed_url)
+deaths_raw    <- read_csv(deaths_url)
+```
+
+## Tidy and Prepare the Data
+
+The original Johns Hopkins files are stored in a wide format, with one column for each date. To make the data easier to analyze and visualize, I convert them into a long format and aggregate them to the country level.
+
+```{r tidy-data, include=FALSE}
+confirmed_long <- confirmed_raw %>%
+  rename(
+    province = `Province/State`,
+    country = `Country/Region`,
+    lat = Lat,
+    long = Long
+  ) %>%
+  pivot_longer(
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    names_to = "date",
+    values_to = "confirmed"
+  ) %>%
+  mutate(date = mdy(date)) %>%
+  group_by(country, date) %>%
+  summarize(confirmed = sum(confirmed, na.rm = TRUE), .groups = "drop")
+
+deaths_long <- deaths_raw %>%
+  rename(
+    province = `Province/State`,
+    country = `Country/Region`,
+    lat = Lat,
+    long = Long
+  ) %>%
+  pivot_longer(
+    cols = matches("^\\d{1,2}/\\d{1,2}/\\d{2}$"),
+    names_to = "date",
+    values_to = "deaths"
+  ) %>%
+  mutate(date = mdy(date)) %>%
+  group_by(country, date) %>%
+  summarize(deaths = sum(deaths, na.rm = TRUE), .groups = "drop")
+
+covid <- confirmed_long %>%
+  left_join(deaths_long, by = c("country", "date")) %>%
+  arrange(country, date) %>%
+  group_by(country) %>%
+  mutate(
+    new_cases = pmax(confirmed - lag(confirmed, default = 0), 0),
+    new_deaths = pmax(deaths - lag(deaths, default = 0), 0),
+    new_cases_7avg = pmax(confirmed - lag(confirmed, 7, default = 0), 0) / 7,
+    new_deaths_7avg = pmax(deaths - lag(deaths, 7, default = 0), 0) / 7,
+    cfr = if_else(confirmed > 0, deaths / confirmed, NA_real_)
+  ) %>%
+  ungroup()
+
+final_totals <- covid %>%
+  group_by(country) %>%
+  summarize(
+    final_confirmed = max(confirmed, na.rm = TRUE),
+    final_deaths = max(deaths, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(final_confirmed))
+
+top10_countries <- final_totals %>%
+  slice_max(final_confirmed, n = 10) %>%
+  pull(country)
+
+top8_countries <- final_totals %>%
+  slice_max(final_confirmed, n = 8) %>%
+  pull(country)
+
+top_country <- final_totals %>%
+  slice_max(final_confirmed, n = 1) %>%
+  pull(country)
+
+covid_top8 <- covid %>%
+  filter(country %in% top8_countries)
+
+n_countries <- covid %>%
+  distinct(country) %>%
+  nrow()
+
+start_date <- min(covid$date, na.rm = TRUE)
+end_date <- max(covid$date, na.rm = TRUE)
+```
+
+After aggregation, the dataset used in this report covers **`r n_countries` countries** from **`r format(start_date, "%Y-%m-%d")`** to **`r format(end_date, "%Y-%m-%d")`**.
+
+## Visualization 1: Top 10 Countries by Final Confirmed Cases
+
+This bar chart compares the countries with the largest cumulative confirmed case totals at the end of the dataset.
+
+```{r plot-top10-cases}
+final_totals %>%
+  slice_max(final_confirmed, n = 10) %>%
+  mutate(country = reorder(country, final_confirmed)) %>%
+  ggplot(aes(x = country, y = final_confirmed)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Top 10 Countries by Final Confirmed COVID-19 Cases",
+    x = "Country",
+    y = "Final Confirmed Cases"
+  ) +
+  theme_minimal()
+```
+
+This plot shows that **`r top_country`** had the largest cumulative confirmed count in this dataset. It also shows that the total burden of reported cases was concentrated in a relatively small number of countries. However, this figure should be interpreted carefully because absolute totals are strongly influenced by population size, testing intensity, and reporting systems.
+
+## Visualization 2: 7-Day Average of New Cases for the Top 8 Countries
+
+Cumulative totals do not show when major outbreaks occurred. To better understand timing, the next figure plots the 7-day average of new cases for the eight countries with the highest final cumulative counts.
+
+```{r plot-top8-trends}
+ggplot(covid_top8, aes(x = date, y = new_cases_7avg, color = country)) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "7-Day Average of New COVID-19 Cases for the Top 8 Countries",
+    x = "Date",
+    y = "Average New Cases per Day",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
+
+This figure shows clear **wave-like up-and-down patterns** for most countries. Rather than rising once and then falling once, many countries experienced several distinct surges separated by periods of decline. Overall, the figure suggests that most countries experienced multiple COVID-19 waves, with alternating periods of increase and decline rather than one single sustained outbreak.
+
+At the same time, the timing and magnitude of these waves were not identical across countries. Some countries show earlier peaks, while others experience their largest surges later in the period. The waves also differ in height, which suggests that transmission intensity, reporting patterns, public health interventions, and later pandemic conditions varied across locations.
+
+Because the peaks are not evenly spaced, I would describe this pattern as **repeated waves** rather than a strict regular cycle.
+
+## Build a Lag-Based Model
+
+Deaths typically occur after infections with some delay. To capture that pattern, I fit a simple exploratory model that predicts the current 7-day average of new deaths using the **14-day lagged 7-day average of new cases**, while also allowing each country to have its own baseline level through country indicators.
+
+This is not a causal model. It is only used to examine whether higher recent case activity tends to be associated with higher later deaths.
+
+```{r model-data, include=FALSE}
+model_data <- covid_top8 %>%
+  group_by(country) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    lag14_cases_7avg = lag(new_cases_7avg, 14)
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(lag14_cases_7avg),
+    !is.na(new_deaths_7avg)
+  )
+
+covid_model <- lm(
+  log1p(new_deaths_7avg) ~ log1p(lag14_cases_7avg) + country,
+  data = model_data
+)
+
+model_data <- model_data %>%
+  mutate(
+    fitted_log_deaths = predict(covid_model),
+    observed_log_deaths = log1p(new_deaths_7avg)
+  )
+
+model_r2 <- summary(covid_model)$r.squared
+case_coef <- coef(covid_model)["log1p(lag14_cases_7avg)"]
+
+coef_table <- coef(summary(covid_model)) %>%
+  as.data.frame() %>%
+  rownames_to_column("term") %>%
+  rename(
+    estimate = Estimate,
+    std_error = `Std. Error`,
+    t_value = `t value`,
+    p_value = `Pr(>|t|)`
+  )
+```
+
+## Visualization 3: Relationship Between Lagged New Cases and Later New Deaths
+
+```{r plot-model-relationship}
+ggplot(model_data, aes(x = log1p(lag14_cases_7avg), y = observed_log_deaths, color = country)) +
+  geom_point(alpha = 0.35, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  labs(
+    title = "Relationship Between Lagged New Cases and Later New Deaths",
+    x = "log(1 + 14-day lagged 7-day avg new cases)",
+    y = "log(1 + current 7-day avg new deaths)",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
+
+The scatter plot shows a clear positive relationship. In general, periods with higher recent case counts tend to be followed by periods with higher death counts. The country-specific lines differ in slope and position, which suggests that the same case level did not always translate into the same later death level across countries.
+
+## Model Results
+
+The fitted model has an R-squared of **`r round(model_r2, 3)`**.  
+The coefficient for `log(1 + lagged new cases)` is **`r round(case_coef, 3)`**.
+
+Because the coefficient is positive, the model suggests that higher recent case counts are associated with higher later death counts on average, even after accounting for country-level differences.
+
+### Selected Model Coefficients
+
+```{r model-coef-table}
+coef_table
+```
+
+The table above provides the estimated coefficients, standard errors, t-values, and p-values for the fitted model. The most important term for this analysis is the lagged case variable, since it summarizes the association between recent cases and later deaths.
+
+## Visualization 4: Observed vs Fitted Values for the Model
+
+A helpful way to assess the model is to compare fitted values with observed values. If the model fits well, the points should lie close to the 45-degree reference line.
+
+```{r plot-model-fit}
+ggplot(model_data, aes(x = fitted_log_deaths, y = observed_log_deaths, color = country)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Observed vs Fitted Values for the Lag-Based Death Model",
+    x = "Fitted log(1 + 7-day avg new deaths)",
+    y = "Observed log(1 + 7-day avg new deaths)",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
+
+This plot shows that the model captures the overall increasing relationship reasonably well, but it is not perfect. Some observations fall far from the dashed line, which means the model either underpredicts or overpredicts deaths during certain periods. That is expected because this model is intentionally simple and uses only lagged cases and country indicators.
+
+## Possible Sources of Bias
+
+Several possible sources of bias may affect both the data and the conclusions of this analysis.
+
+### Bias in the Data
+
+**Underreporting bias:** Confirmed case counts depend on testing access, public health infrastructure, and whether infected people were actually tested. Countries with lower testing capacity may have had more infections than reported.
+
+**Reporting delay bias:** Cases and deaths were sometimes reported late or in batches. This can create sudden spikes or drops that reflect administrative timing rather than real epidemic change.
+
+**Definition bias:** Countries did not always use the same rules for defining a confirmed COVID-19 case or a COVID-related death.
+
+**Population-size bias:** Countries with larger populations tend to have higher total case counts, so comparing raw totals can favor large countries in rankings.
+
+### Bias in the Analysis
+
+**Aggregation bias:** Province/state records were collapsed to the country level. This makes the analysis simpler, but it hides important regional variation within countries.
+
+**Smoothing bias:** The 7-day average reduces noise, but it can also smooth away sharp daily changes and make some transitions appear more gradual than they really were.
+
+**Lag bias:** The model uses a 14-day lag, but the delay from infection to death is not identical across countries or time periods.
+
+**Omitted variable bias:** The model does not include vaccination coverage, age structure, treatment availability, variant type, healthcare system strain, or government policy responses. These omitted factors may affect death outcomes.
+
+**Interpretation bias:** The repeated up-and-down waves in the figure may look cyclical, but they should not automatically be interpreted as a fixed periodic process. Some of that pattern may reflect true epidemic waves, while some may reflect reporting and policy changes.
+
+## Unique Analysis Beyond the Basic Class Example
+
+A part of this report that goes beyond a basic descriptive COVID plot is the use of a **14-day lag-based regression model** and a **model fit evaluation plot**. Instead of only plotting cumulative totals, this report uses the time-series structure of the data to study how recent case activity is associated with later deaths.
+
+In addition, the repeated wave pattern in the 7-day average case figure adds another layer of interpretation. The data suggests that many countries experienced multiple surges rather than one single outbreak, which helps explain why simple one-period summaries are not enough to describe the pandemic.
+
+## Conclusion
+
+This report used the Johns Hopkins CSSE global COVID-19 time-series data to study how the pandemic evolved across the countries with the largest cumulative confirmed case totals.
+
+The main findings are:
+
+- A small number of countries accounted for the largest cumulative confirmed case counts.
+- Many countries showed repeated wave-like rises and falls in new cases over time.
+- These waves were not perfectly synchronized across countries.
+- Higher recent case levels were associated with higher later death levels in the lag-based model.
+- The model fit was reasonable overall, but there was still substantial unexplained variation.
+
+These results should be interpreted with caution. The dataset is highly useful for understanding broad patterns, but it is affected by underreporting, reporting delays, definitional differences, and international differences in testing and healthcare systems. The model is also intentionally simple and exploratory rather than causal. Even so, the report provides a useful view of how COVID-19 case waves unfolded and how case surges were related to later mortality.
+
+## References
+
+Johns Hopkins University CSSE COVID-19 Data Repository
+
+Global confirmed cases file:
+https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv`
+
+Global deaths file: 
+https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_global.csv`
